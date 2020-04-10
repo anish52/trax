@@ -27,6 +27,15 @@ from trax.rl import distributions
 from trax.rl import training as rl_training
 
 
+@tl.layer(n_in=3, n_out=1)
+def ValueLoss(x, value_loss_coeff, **unused_kwargs):
+  """Definition of the Proximal Policy Optimization loss."""
+  _, values, returns = x
+  advantages = returns - values
+  l2_value_loss = jnp.mean(advantages**2) * value_loss_coeff
+  return l2_value_loss
+
+
 class ActorCriticJointTrainer(rl_training.RLTrainer):
   """Trains a joint policy-and-value model using actor-critic methods."""
 
@@ -61,7 +70,6 @@ class ActorCriticJointTrainer(rl_training.RLTrainer):
     self._collect_per_epoch = collect_per_epoch
     self._max_slice_length = max_slice_length
     self._policy_dist = distributions.create_distribution(task.action_space)
-    self._total_samples = 0
     self._lr_schedule = lr_schedule
     self._optimizer = optimizer
 
@@ -114,16 +122,20 @@ class ActorCriticJointTrainer(rl_training.RLTrainer):
     return AdvantageMean
 
   @property
-  def value_loss(self):
-    """Value loss - so far generic for all A2C."""
+  def advantage_norm(self):
+    """Mean of advantages."""
     @tl.layer(n_in=3, n_out=1)
-    def ValueLoss(x, **unused_kwargs):
-      """Definition of the Proximal Policy Optimization loss."""
+    def AdvantageNorm(x, **unused_kwargs):
+      """Definition of the mean of advantages."""
       _, values, returns = x
       advantages = returns - values
-      l2_value_loss = jnp.sum(advantages**2) * self._value_loss_coeff
-      return l2_value_loss
-    return ValueLoss
+      return jnp.linalg.norm(advantages)
+    return AdvantageNorm
+
+  @property
+  def value_loss(self):
+    """Value loss - so far generic for all A2C."""
+    return functools.partial(ValueLoss, value_loss_coeff=self._value_loss_coeff)
 
   @property
   def log_probs_mean(self):
@@ -176,6 +188,109 @@ class ActorCriticJointTrainer(rl_training.RLTrainer):
           self._supervised_eval_steps)
 
 
+@tl.layer(n_in=2, n_out=1)
+def NewLogProbs(x, log_prob_fun, **unused_kwargs):
+  """Definition of the Entropy Layer."""
+  dist_inputs, actions = x
+  new_log_probs = log_prob_fun(dist_inputs,
+                               actions)
+  new_log_probs = jnp.array(new_log_probs.squeeze(axis=-1))
+  return new_log_probs
+
+
+@tl.layer(n_in=4, n_out=1)
+def EntropyLoss(x, log_prob_fun, entropy_coeff, entropy_fun, **unused_kwargs):
+  """Definition of the Entropy Layer."""
+  dist_inputs, _, _, actions = x
+  new_log_probs = functools.partial(
+      NewLogProbs,
+      log_prob_fun=log_prob_fun)(
+          (dist_inputs, actions))
+  entropy_loss = entropy_fun(new_log_probs) * entropy_coeff
+  return entropy_loss
+
+
+@tl.layer(n_in=3, n_out=1)
+def ProbsRatio(x, log_prob_fun, **unused_kwargs):
+  """Probability Ratio from the PPO algorithm."""
+  dist_inputs, actions, old_log_probs = x
+
+  # Old log probs have an undesirable extra dimension which we remove here
+  old_log_probs = jnp.array(old_log_probs.squeeze(axis=-1),
+                            dtype=jnp.float32)
+  new_log_probs = functools.partial(
+      NewLogProbs,
+      log_prob_fun=log_prob_fun)(
+          (dist_inputs, actions))
+
+  # The ratio between new_probs and old_probs expressed
+  # using log_probs and exponentaion
+  probs_ratio = jnp.exp(new_log_probs - old_log_probs)
+  return probs_ratio
+
+
+@tl.layer(n_in=3, n_out=1)
+def ApproximateKLDivergence(x, log_prob_fun, **unused_kwargs):
+  """Probability Ratio from the PPO algorithm."""
+  dist_inputs, actions, old_log_probs = x
+
+  # Old log probs have an undesirable extra dimension which we remove here
+  old_log_probs = jnp.array(old_log_probs.squeeze(axis=-1),
+                            dtype=jnp.float32)
+  new_log_probs = functools.partial(
+      NewLogProbs,
+      log_prob_fun=log_prob_fun)(
+          (dist_inputs, actions))
+
+  # The ratio between new_probs and old_probs expressed
+  # using log_probs and exponentaion
+  approximate_kl_divergence = 0.5 * \
+      jnp.mean(new_log_probs - old_log_probs) ** 2
+  return approximate_kl_divergence
+
+
+@tl.layer(n_in=2, n_out=1)
+def UnclippedObjective(x, **unused_kwargs):
+  """Probability Ratio from the PPO algorithm."""
+  probs_ratio, advantages = x
+  unclipped_objective = probs_ratio * advantages
+
+  return unclipped_objective
+
+
+@tl.layer(n_in=2, n_out=1)
+def ClippedObjective(x, epsilon, **unused_kwargs):
+  """Probability Ratio from the PPO algorithm."""
+  probs_ratio, advantages = x
+  clipped_objective = jnp.clip(probs_ratio, 1 - epsilon,
+                               1 + epsilon) * advantages
+
+  return clipped_objective
+
+
+@tl.layer(n_in=5, n_out=1)
+def PPOObjective(x, log_prob_fun, epsilon, **unused_kwargs):
+  """Probability Ratio from the PPO algorithm."""
+  dist_inputs, values, returns, actions, old_log_probs = x
+
+  # Old log probs have an undesirable extra dimension which we remove here
+  old_log_probs = jnp.array(old_log_probs.squeeze(axis=-1),
+                            dtype=jnp.float32)
+  # The ratio between new_probs and old_probs expressed
+  # using log_probs and exponentaion
+  probs_ratio = functools.partial(
+      ProbsRatio, log_prob_fun=log_prob_fun)(
+          (dist_inputs, actions, old_log_probs))
+  advantages = returns - values
+  unclipped_objective = UnclippedObjective((probs_ratio, advantages))
+  clipped_objective = functools.partial(
+      ClippedObjective, epsilon=epsilon)((probs_ratio, advantages))
+
+  ppo_objective = jnp.minimum(unclipped_objective, clipped_objective)
+
+  return ppo_objective
+
+
 class PPOJointTrainer(ActorCriticJointTrainer):
   """The Proximal Policy Optimization Algorithm aka PPO.
 
@@ -202,10 +317,16 @@ class PPOJointTrainer(ActorCriticJointTrainer):
         output_dir=self._output_dir,
         metrics={'joint_loss': self.joint_loss,
                  'advantage_mean': self.advantage_mean,
+                 'advantage_norm': self.advantage_norm,
                  'value_loss': self.value_loss,
                  'log_probs_mean': self.log_probs_mean,
                  'entropy_loss': self.entropy_loss,
                  'probs_ratio_mean': self.probs_ratio_mean,
+                 'unclipped_objective_mean': self.unclipped_objective_mean,
+                 'clipped_objective_mean': self.clipped_objective_mean,
+                 'ppo_objective_mean': self.ppo_objective_mean,
+                 'clip_fraction': self.clip_fraction,
+                 'approximate_kl_divergence': self.approximate_kl_divergence,
                  'preferred_move': self.preferred_move})
 
   def batches_stream(self):
@@ -214,9 +335,6 @@ class PPOJointTrainer(ActorCriticJointTrainer):
         self._batch_size, max_slice_length=self._max_slice_length, epochs=[-1]):
       # Insert an extra depth dimension, so the target shape is consistent with
       # the network output shape.
-      self._total_samples += np_trajectory.observations.shape[0]
-      if self._sw is not None:
-        self._sw.scalar('total_samples', self._total_samples)
       yield (np_trajectory.observations,         # Inputs to the value model.
              np_trajectory.returns[:, :, None],
              np_trajectory.actions,
@@ -232,27 +350,16 @@ class PPOJointTrainer(ActorCriticJointTrainer):
       """Definition of the Proximal Policy Optimization loss."""
       dist_inputs, values, returns, actions, old_log_probs, mask = x
       del mask  # TODO(lukaszkaiser): make PPO work with Transformer
-      new_log_probs = self._policy_dist.log_prob(dist_inputs, actions)
 
-      advantages = returns - values
-      l2_value_loss = jnp.sum(advantages**2) * self._value_loss_coeff
+      ppo_objective = functools.partial(
+          PPOObjective,
+          log_prob_fun=self._policy_dist.log_prob,
+          epsilon=self._epsilon)(
+              (dist_inputs, values, returns, actions, old_log_probs))
 
-      # Old log probs have an undesirable extra dimension which we remove here
-      old_log_probs = jnp.array(old_log_probs.squeeze(axis=-1),
-                                dtype=jnp.float32)
-      new_log_probs = jnp.array(new_log_probs.squeeze(axis=-1))
+      entropy_loss = self.entropy_loss((dist_inputs, values, returns, actions))
 
-      # The ratio between new_probs and old_probs expressed
-      # using log_probs and exponentaion
-      probs_ratio = jnp.exp(new_log_probs - old_log_probs)
-      unclipped_objective = probs_ratio * advantages
-      clipped_objective = jnp.clip(probs_ratio,
-                                   1 - self._epsilon,
-                                   1 + self._epsilon) * advantages
-      ppo_objective = jnp.minimum(unclipped_objective, clipped_objective)
-
-      entropy_loss = self._policy_dist.entropy(new_log_probs) *\
-          self._entropy_coeff
+      l2_value_loss = self.value_loss((dist_inputs, values, returns))
 
       return -ppo_objective.mean() + l2_value_loss - entropy_loss
     return PPOJointLoss
@@ -264,48 +371,89 @@ class PPOJointTrainer(ActorCriticJointTrainer):
     def ProbsRatioMean(x, **unused_kwargs):
       """Probability Ratio Mean from the PPO algorithm."""
       dist_inputs, _, _, actions, old_log_probs = x
-      new_log_probs = self._policy_dist.log_prob(dist_inputs, actions)
-
-      # Old log probs have an undesirable extra dimension which we remove here
-      old_log_probs = jnp.array(old_log_probs.squeeze(axis=-1),
-                                dtype=jnp.float32)
-      new_log_probs = jnp.array(new_log_probs.squeeze(axis=-1))
-
-      # The ratio between new_probs and old_probs expressed
-      # using log_probs and exponentaion
-      probs_ratio = jnp.exp(new_log_probs - old_log_probs)
+      probs_ratio = functools.partial(
+          ProbsRatio,
+          log_prob_fun=self._policy_dist.log_prob)(
+              (dist_inputs, actions, old_log_probs))
       return jnp.mean(probs_ratio)
     return ProbsRatioMean
 
   @property
+  def clip_fraction(self):
+    """Joint policy and value loss layer."""
+    @tl.layer(n_in=5, n_out=1)
+    def ClipFraction(x, **unused_kwargs):
+      """Probability Ratio Mean from the PPO algorithm."""
+      dist_inputs, _, _, actions, old_log_probs = x
+      probs_ratio = functools.partial(
+          ProbsRatio,
+          log_prob_fun=self._policy_dist.log_prob)(
+              (dist_inputs, actions, old_log_probs))
+      return jnp.mean(jnp.abs(probs_ratio - 1) > self._epsilon)
+    return ClipFraction
+
+  @property
   def entropy_loss(self):
     """Entropy layer."""
-    @tl.layer(n_in=4, n_out=1)
-    def EntropyLoss(x, **unused_kwargs):
-      """Definition of the Entropy Layer."""
-      dist_inputs, _, _, actions = x
-      new_log_probs = self._policy_dist.log_prob(dist_inputs, actions)
-      new_log_probs = jnp.array(new_log_probs.squeeze(axis=-1))
-      entropy_loss = self._policy_dist.entropy(new_log_probs) *\
-          self._entropy_coeff
-      return entropy_loss
-    return EntropyLoss
+    return functools.partial(EntropyLoss,
+                             log_prob_fun=self._policy_dist.log_prob,
+                             entropy=self._entropy_coeff,
+                             entropy_fun=self._policy_dist.entropy)
 
-  # TODO(henrykm) Add more debug PPO metrics
+  @property
+  def approximate_kl_divergence(self):
+    """Entropy layer."""
+    return functools.partial(ApproximateKLDivergence,
+                             log_prob_fun=self._policy_dist.log_prob)
+
   @property
   def unclipped_objective_mean(self):
-    """Unclipped objective - make sense for PPO."""
-    return NotImplementedError
+    @tl.layer(n_in=5, n_out=1)
+    def UnclippedObjectiveMean(x, **unused_kwargs):
+      """Unclipped objective Mean from the PPO algorithm."""
+      dist_inputs, values, returns, actions, old_log_probs = x
+      advantages = returns - values
+      probs_ratio = functools.partial(
+          ProbsRatio,
+          log_prob_fun=self._policy_dist.log_prob)(
+              (dist_inputs, actions, old_log_probs))
+      unclipped_objective = UnclippedObjective((probs_ratio, advantages))
+      return jnp.mean(unclipped_objective)
+    return UnclippedObjectiveMean
 
   @property
   def clipped_objective_mean(self):
-    """Clipped objective - make sense for PPO."""
-    return NotImplementedError
+    @tl.layer(n_in=5, n_out=1)
+    def ClippedObjectiveMean(x, **unused_kwargs):
+      """Clipped objective from the PPO algorithm."""
+      dist_inputs, values, returns, actions, old_log_probs = x
+      advantages = returns - values
+      probs_ratio = functools.partial(
+          ProbsRatio,
+          log_prob_fun=self._policy_dist.log_prob)(
+              (dist_inputs, actions, old_log_probs))
+      clipped_objective = functools.partial(
+          ClippedObjective,
+          epsilon=self._epsilon)(
+              (probs_ratio, advantages))
+      return jnp.mean(clipped_objective)
+    return ClippedObjectiveMean
 
   @property
   def ppo_objective_mean(self):
-    """PPO objective - make sense for PPO."""
-    return NotImplementedError
+    """PPO objective mean."""
+    @tl.layer(n_in=5, n_out=1)
+    def PPOObjectiveMean(x, **unused_kwargs):
+      """Clipped objective from the PPO algorithm."""
+      dist_inputs, values, returns, actions, old_log_probs = x
+      ppo_objective = functools.partial(
+          PPOObjective,
+          log_prob_fun=self._policy_dist.log_prob,
+          epsilon=self._epsilon)(
+              (dist_inputs, values, returns, actions, old_log_probs))
+
+      return jnp.mean(ppo_objective)
+    return PPOObjectiveMean
 
 
 class AWRJointTrainer(ActorCriticJointTrainer):
@@ -341,6 +489,6 @@ class AWRJointTrainer(ActorCriticJointTrainer):
       logps = self._policy_dist.log_prob(preds, actions)
       awr_loss = actor_critic.AWRLoss(beta=self._beta, w_max=self._w_max)(
           (logps, advantages, jnp.zeros_like(logps), mask))
-      l2_value_loss = jnp.sum((returns - values)**2) * self._value_loss_coeff
+      l2_value_loss = jnp.mean((returns - values)**2) * self._value_loss_coeff
       return awr_loss + l2_value_loss
     return AWRJointLoss

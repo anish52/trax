@@ -146,6 +146,8 @@ class RLTrainer:
         self._sw.scalar('timing/collect', time.time() - cur_time,
                         step=self._epoch)
         self._sw.scalar('rl/avg_return', avg_return, step=self._epoch)
+        self._sw.scalar('rl/total_frames', self.task.num_timesteps(),
+                        step=self._epoch)
         self._sw.flush()
       if self._output_dir is not None:
         self.save_to_file()
